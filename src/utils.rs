@@ -116,7 +116,7 @@ pub fn memory_footprint_bytes(n_vectors: usize, d: usize, bit_width: usize) -> M
 
     let mse_bytes = (n_vectors * d * mse_bits + 7) / 8;
     let qjl_bytes = (n_vectors * d * qjl_bits + 7) / 8;
-    let norm_bytes = n_vectors * 4; // float32 per vector
+    let norm_bytes = n_vectors * 8; // two float32 norms per vector
     let total = mse_bytes + qjl_bytes + norm_bytes;
     let original = n_vectors * d * 2; // fp16
 

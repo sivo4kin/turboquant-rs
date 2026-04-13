@@ -176,10 +176,10 @@ impl KVCacheCompressor {
         let n_vectors = num_layers * num_heads * seq_len;
         let original_bytes = n_vectors * self.head_dim * 2; // fp16
 
-        // K: b bits per coord + 32-bit norm
-        let k_bits_total = n_vectors * (self.head_dim * self.k_bits + 32);
-        // V: b bits per coord
-        let v_bits_total = n_vectors * self.head_dim * self.v_bits;
+        // K (TurboQuant): b bits per coord + two 32-bit norms (vector + residual)
+        let k_bits_total = n_vectors * (self.head_dim * self.k_bits + 64);
+        // V (MSE): b bits per coord + one 32-bit norm
+        let v_bits_total = n_vectors * (self.head_dim * self.v_bits + 32);
 
         let compressed_bytes = (k_bits_total + v_bits_total) / 8;
 

@@ -111,14 +111,14 @@ impl TurboQuant {
     /// Compute total storage in bits for `n_vectors` compressed vectors.
     pub fn compressed_size_bits(&self, n_vectors: usize) -> usize {
         let per_vector = self.d * self.bit_width; // (b-1) + 1 bits per coordinate
-        let norms = 32; // float32 per vector
+        let norms = 64; // two float32 norms per vector: vector_norm + residual_norm
         n_vectors * (per_vector + norms)
     }
 
     /// Compute compression ratio vs original precision.
     pub fn compression_ratio(&self, original_bits_per_value: usize) -> f64 {
         let original_per_vector = self.d * original_bits_per_value;
-        let compressed_per_vector = self.d * self.bit_width + 32; // +32 for norm
+        let compressed_per_vector = self.d * self.bit_width + 64; // +64 for two norms
         original_per_vector as f64 / compressed_per_vector as f64
     }
 }
@@ -235,8 +235,8 @@ mod tests {
     fn test_compression_ratio() {
         let tq = TurboQuant::new(128, 3, 42, true);
         let ratio = tq.compression_ratio(16);
-        // 3 bits per coord + 32 bits norm overhead → ratio ≈ 128*16 / (128*3 + 32)
-        let expected = (128.0 * 16.0) / (128.0 * 3.0 + 32.0);
+        // 3 bits per coord + 64 bits norm overhead (vector + residual)
+        let expected = (128.0 * 16.0) / (128.0 * 3.0 + 64.0);
         assert!(
             (ratio - expected).abs() < 0.01,
             "Compression ratio: {ratio}, expected: {expected}"
