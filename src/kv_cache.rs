@@ -27,6 +27,8 @@ pub struct CompressedKVCache {
     pub head_dim: usize,
     pub k_bit_width: usize,
     pub v_bit_width: usize,
+    /// Per-layer key bit-width used during compression.
+    pub k_layer_bits: Vec<usize>,
 }
 
 /// Compress and decompress transformer KV cache tensors.
@@ -40,8 +42,11 @@ pub struct KVCacheCompressor {
     pub head_dim: usize,
     pub k_bits: usize,
     pub v_bits: usize,
-    k_quantizer: TurboQuant,
     v_quantizer: TurboQuantMSE,
+    seed: u64,
+    norm_correction: bool,
+    boundary_layers: usize,
+    boundary_k_bits: Option<usize>,
 }
 
 impl KVCacheCompressor {
@@ -60,16 +65,51 @@ impl KVCacheCompressor {
         seed: u64,
         norm_correction: bool,
     ) -> Self {
-        let k_quantizer = TurboQuant::new(head_dim, k_bits, seed, norm_correction);
         let v_quantizer = TurboQuantMSE::new(head_dim, v_bits, seed + 500, norm_correction);
 
         Self {
             head_dim,
             k_bits,
             v_bits,
-            k_quantizer,
             v_quantizer,
+            seed,
+            norm_correction,
+            boundary_layers: 0,
+            boundary_k_bits: None,
         }
+    }
+
+    /// Create a compressor with boundary-layer K precision protection.
+    ///
+    /// The first and last `boundary_layers` transformer layers use `boundary_k_bits`
+    /// for K-cache quantization, while middle layers use `k_bits`.
+    pub fn with_boundary_k_bits(
+        head_dim: usize,
+        k_bits: usize,
+        v_bits: usize,
+        seed: u64,
+        norm_correction: bool,
+        boundary_layers: usize,
+        boundary_k_bits: usize,
+    ) -> Self {
+        assert!(
+            boundary_k_bits >= k_bits,
+            "boundary_k_bits should be >= base k_bits"
+        );
+        let mut compressor = Self::new(head_dim, k_bits, v_bits, seed, norm_correction);
+        compressor.boundary_layers = boundary_layers;
+        compressor.boundary_k_bits = Some(boundary_k_bits);
+        compressor
+    }
+
+    fn layer_k_bits(&self, layer: usize, num_layers: usize) -> usize {
+        if let Some(boundary_bits) = self.boundary_k_bits {
+            let n = self.boundary_layers.min(num_layers / 2);
+            if layer < n || layer >= num_layers.saturating_sub(n) {
+                return boundary_bits;
+            }
+        }
+        self.k_bits
     }
 
     /// Compress full KV cache tensors.
@@ -93,12 +133,28 @@ impl KVCacheCompressor {
             head_dim,
             k_bit_width: self.k_bits,
             v_bit_width: self.v_bits,
+            k_layer_bits: Vec::with_capacity(num_layers),
         };
+
+        let base_k_quantizer = TurboQuant::new(self.head_dim, self.k_bits, self.seed, self.norm_correction);
+        let boundary_k_quantizer = self
+            .boundary_k_bits
+            .map(|b| TurboQuant::new(self.head_dim, b, self.seed, self.norm_correction));
 
         for layer in 0..num_layers {
             let mut k_layer = Vec::with_capacity(num_heads);
             let mut v_layer_idx = Vec::with_capacity(num_heads);
             let mut v_layer_norms = Vec::with_capacity(num_heads);
+            let layer_k_bits = self.layer_k_bits(layer, num_layers);
+            result.k_layer_bits.push(layer_k_bits);
+
+            let k_quantizer = if layer_k_bits == self.k_bits {
+                &base_k_quantizer
+            } else {
+                boundary_k_quantizer
+                    .as_ref()
+                    .expect("boundary quantizer missing for boundary layer bits")
+            };
 
             for head in 0..num_heads {
                 // Extract (seq_len, head_dim) slice for this layer/head
@@ -112,7 +168,7 @@ impl KVCacheCompressor {
                 }
 
                 // K: batch quantize all seq positions
-                let k_compressed = self.k_quantizer.quantize_batch(&k_vecs);
+                let k_compressed = k_quantizer.quantize_batch(&k_vecs);
                 k_layer.push(k_compressed);
 
                 // V: MSE quantize
@@ -142,9 +198,16 @@ impl KVCacheCompressor {
         let mut v_cache = Array4::zeros(k_cache.raw_dim());
 
         for layer in 0..compressed.num_layers {
+            let layer_k_bits = compressed
+                .k_layer_bits
+                .get(layer)
+                .copied()
+                .unwrap_or(compressed.k_bit_width);
+            let k_quantizer =
+                TurboQuant::new(self.head_dim, layer_k_bits, self.seed, self.norm_correction);
             for head in 0..compressed.num_heads {
                 // K: dequantize
-                let k_hat = self.k_quantizer.dequantize(&compressed.k_compressed[layer][head]);
+                let k_hat = k_quantizer.dequantize(&compressed.k_compressed[layer][head]);
                 for s in 0..compressed.seq_len {
                     for d in 0..compressed.head_dim {
                         k_cache[[layer, head, s, d]] = k_hat[[s, d]];
@@ -185,8 +248,12 @@ impl KVCacheCompressor {
         let n_vectors = num_layers * num_heads * seq_len;
         let original_bytes = n_vectors * self.head_dim * 2; // fp16
 
-        // K (TurboQuant): b bits per coord + two 32-bit norms (vector + residual)
-        let k_bits_total = n_vectors * (self.head_dim * self.k_bits + 64);
+        let mut k_bits_total = 0usize;
+        for layer in 0..num_layers {
+            let layer_k_bits = self.layer_k_bits(layer, num_layers);
+            let layer_vectors = num_heads * seq_len;
+            k_bits_total += layer_vectors * (self.head_dim * layer_k_bits + 64);
+        }
         // V (MSE): b bits per coord + one 32-bit norm
         let v_bits_total = n_vectors * (self.head_dim * self.v_bits + 32);
 
@@ -259,5 +326,24 @@ mod tests {
         let stats = compressor.memory_stats(1024, 32, 32);
         assert!(stats.compression_ratio > 1.0, "Should compress");
         assert!(stats.compressed_mb < stats.original_mb, "Should be smaller");
+    }
+
+    #[test]
+    fn test_boundary_k_bits_policy() {
+        let compressor = KVCacheCompressor::with_boundary_k_bits(16, 3, 3, 42, true, 1, 4);
+
+        let k_cache = Array4::from_shape_fn((4, 1, 2, 16), |(l, _, s, d)| {
+            ((l * 32 + s * 16 + d) as f64 + 1.0) / 100.0
+        });
+        let v_cache = Array4::from_shape_fn((4, 1, 2, 16), |(l, _, s, d)| {
+            ((l * 32 + s * 16 + d) as f64 + 10.0) / 100.0
+        });
+
+        let compressed = compressor.compress(&k_cache, &v_cache);
+        assert_eq!(compressed.k_layer_bits, vec![4, 3, 3, 4]);
+
+        let (k_hat, v_hat) = compressor.decompress(&compressed);
+        assert_eq!(k_hat.shape(), k_cache.shape());
+        assert_eq!(v_hat.shape(), v_cache.shape());
     }
 }
