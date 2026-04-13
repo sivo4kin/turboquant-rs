@@ -18,7 +18,7 @@
 //! ## Quick start
 //!
 //! ```rust
-//! use turboquant::{TurboQuant, TurboQuantMSE, KVCacheCompressor};
+//! use turboquant_plus_rs::{TurboQuant, TurboQuantMSE, KVCacheCompressor};
 //! use ndarray::Array1;
 //!
 //! // Single-vector quantization

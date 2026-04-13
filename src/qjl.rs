@@ -117,6 +117,13 @@ impl QJL {
 mod tests {
     use super::*;
 
+    fn synthetic_batch(batch: usize, d: usize) -> Array2<f64> {
+        Array2::from_shape_fn((batch, d), |(i, j)| {
+            let t = (i * 17 + j * 5) as f64;
+            (t / d as f64).sin() + 0.2 * (t / 9.0).cos()
+        })
+    }
+
     #[test]
     fn test_sign_quantization() {
         let qjl = QJL::new(32, 42);
@@ -146,26 +153,30 @@ mod tests {
 
     #[test]
     fn test_inner_product_preservation() {
-        // QJL at 1-bit is very noisy; with d projections the variance is high.
-        // Use a larger dimension to get better concentration.
         let d = 256;
         let qjl = QJL::new(d, 42);
-        let x = Array1::from_shape_fn(d, |i| (i as f64 + 1.0) / d as f64);
-        let y = Array1::from_shape_fn(d, |i| (d as f64 - i as f64) / d as f64);
+        let batch = synthetic_batch(64, d);
+        let (signs, norms) = qjl.quantize_batch(&batch);
+        let batch_hat = qjl.dequantize_batch(&signs, &norms);
 
-        let ip_original = x.dot(&y);
-
-        let (sx, nx) = qjl.quantize(&x);
-        let (sy, ny) = qjl.quantize(&y);
-        let x_hat = qjl.dequantize(&sx, nx);
-        let y_hat = qjl.dequantize(&sy, ny);
-        let ip_approx = x_hat.dot(&y_hat);
-
-        // 1-bit QJL is inherently noisy; just verify the estimate is in the right ballpark
-        let relative_error = (ip_original - ip_approx).abs() / ip_original.abs();
+        let mut total_rel_err = 0.0;
+        let mut n_pairs = 0usize;
+        for i in 0..32 {
+            let j = (i * 7 + 3) % 64;
+            let x = batch.row(i);
+            let y = batch.row(j);
+            let x_hat = batch_hat.row(i);
+            let y_hat = batch_hat.row(j);
+            let ip_original = x.dot(&y);
+            let ip_approx = x_hat.dot(&y_hat);
+            let denom = ip_original.abs().max(1e-8);
+            total_rel_err += (ip_original - ip_approx).abs() / denom;
+            n_pairs += 1;
+        }
+        let relative_error = total_rel_err / n_pairs as f64;
         assert!(
-            relative_error < 5.0,
-            "Inner product relative error too large: {relative_error}"
+            relative_error < 2.5,
+            "Mean inner product relative error too large: {relative_error}"
         );
     }
 }
