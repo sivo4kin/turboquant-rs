@@ -77,6 +77,14 @@ pub fn pack_indices(indices: &Array1<usize>, bit_width: usize) -> Vec<u8> {
     }
 }
 
+/// Pack batch of b-bit index arrays into compact byte vectors.
+pub fn pack_indices_batch(indices: &Array2<usize>, bit_width: usize) -> Vec<Vec<u8>> {
+    let batch = indices.nrows();
+    (0..batch)
+        .map(|i| pack_indices(&indices.row(i).to_owned(), bit_width))
+        .collect()
+}
+
 /// Unpack b-bit indices from compact byte array.
 ///
 /// # Arguments
@@ -107,6 +115,17 @@ pub fn unpack_indices(packed: &[u8], n: usize, bit_width: usize) -> Array1<usize
     } else {
         Array1::from_vec(packed[..n].iter().map(|&v| v as usize).collect())
     }
+}
+
+/// Unpack batch of b-bit index arrays from compact byte vectors.
+pub fn unpack_indices_batch(packed: &[Vec<u8>], n: usize, bit_width: usize) -> Array2<usize> {
+    let batch = packed.len();
+    let mut indices = Array2::zeros((batch, n));
+    for (i, packed_row) in packed.iter().enumerate() {
+        let row = unpack_indices(packed_row, n, bit_width);
+        indices.row_mut(i).assign(&row);
+    }
+    indices
 }
 
 /// Calculate memory footprint of compressed KV cache.
@@ -187,6 +206,14 @@ mod tests {
         let indices = Array1::from_vec(vec![0usize, 127, 255, 42]);
         let packed = pack_indices(&indices, 8);
         let unpacked = unpack_indices(&packed, indices.len(), 8);
+        assert_eq!(indices, unpacked);
+    }
+
+    #[test]
+    fn test_pack_unpack_indices_batch() {
+        let indices = Array2::from_shape_vec((2, 4), vec![0usize, 1, 2, 3, 3, 2, 1, 0]).unwrap();
+        let packed = pack_indices_batch(&indices, 2);
+        let unpacked = unpack_indices_batch(&packed, 4, 2);
         assert_eq!(indices, unpacked);
     }
 

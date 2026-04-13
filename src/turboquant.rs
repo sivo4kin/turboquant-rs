@@ -12,19 +12,22 @@ use ndarray::{Array1, Array2, Axis};
 
 use crate::polar_quant::PolarQuant;
 use crate::qjl::QJL;
+use crate::utils::{pack_bits_batch, pack_indices_batch, unpack_bits, unpack_indices_batch};
 
 /// Container for TurboQuant-compressed vectors (batch format).
 pub struct CompressedVectors {
-    /// PolarQuant indices, (b-1)-bit integers. Shape: (batch, d).
-    pub mse_indices: Array2<usize>,
-    /// Original ‖x‖₂ norms for rescaling. Shape: (batch,).
-    pub vector_norms: Array1<f64>,
-    /// QJL sign bits {+1, -1}. Shape: (batch, d).
-    pub qjl_signs: Array2<i8>,
-    /// Residual ‖r‖₂ norms. Shape: (batch,).
-    pub residual_norms: Array1<f64>,
+    /// PolarQuant indices packed to bytes. Length: batch.
+    pub mse_indices_packed: Vec<Vec<u8>>,
+    /// Original ‖x‖₂ norms for rescaling (stored as float32). Length: batch.
+    pub vector_norms: Vec<f32>,
+    /// QJL sign bits packed to bytes. Length: batch.
+    pub qjl_signs_packed: Vec<Vec<u8>>,
+    /// Residual ‖r‖₂ norms (stored as float32). Length: batch.
+    pub residual_norms: Vec<f32>,
     /// Total bits per coordinate.
     pub bit_width: usize,
+    /// Vector dimension.
+    pub d: usize,
 }
 
 /// Full TurboQuant quantizer: PolarQuant (b-1 bits) + QJL (1 bit).
@@ -85,25 +88,65 @@ impl TurboQuant {
         let (qjl_signs, residual_norms) = self.qjl.quantize_batch(&residual);
 
         CompressedVectors {
-            mse_indices,
-            vector_norms,
-            qjl_signs,
-            residual_norms,
+            mse_indices_packed: pack_indices_batch(&mse_indices, self.bit_width - 1),
+            vector_norms: vector_norms.iter().map(|&v| v as f32).collect(),
+            qjl_signs_packed: pack_bits_batch(&qjl_signs),
+            residual_norms: residual_norms.iter().map(|&v| v as f32).collect(),
             bit_width: self.bit_width,
+            d: self.d,
         }
     }
 
     /// Dequantize back to approximate vectors.
     pub fn dequantize(&self, compressed: &CompressedVectors) -> Array2<f64> {
+        let batch = compressed.vector_norms.len();
+        assert_eq!(compressed.d, self.d, "compressed dimension mismatch");
+        assert_eq!(
+            compressed.mse_indices_packed.len(),
+            batch,
+            "mse packed batch size mismatch"
+        );
+        assert_eq!(
+            compressed.qjl_signs_packed.len(),
+            batch,
+            "qjl packed batch size mismatch"
+        );
+        assert_eq!(
+            compressed.residual_norms.len(),
+            batch,
+            "residual norms batch size mismatch"
+        );
+
+        let mse_indices = unpack_indices_batch(
+            &compressed.mse_indices_packed,
+            self.d,
+            compressed.bit_width - 1,
+        );
+        let vector_norms = Array1::from_vec(
+            compressed
+                .vector_norms
+                .iter()
+                .map(|&v| v as f64)
+                .collect::<Vec<_>>(),
+        );
+        let mut qjl_signs = Array2::zeros((batch, self.d));
+        for (i, packed) in compressed.qjl_signs_packed.iter().enumerate() {
+            let signs = unpack_bits(packed, self.d);
+            qjl_signs.row_mut(i).assign(&signs);
+        }
+        let residual_norms = Array1::from_vec(
+            compressed
+                .residual_norms
+                .iter()
+                .map(|&v| v as f64)
+                .collect::<Vec<_>>(),
+        );
+
         // Stage 1: PolarQuant reconstruction
-        let x_mse = self
-            .polar_quant
-            .dequantize_batch(&compressed.mse_indices, &compressed.vector_norms);
+        let x_mse = self.polar_quant.dequantize_batch(&mse_indices, &vector_norms);
 
         // Stage 2: QJL residual reconstruction
-        let x_qjl = self
-            .qjl
-            .dequantize_batch(&compressed.qjl_signs, &compressed.residual_norms);
+        let x_qjl = self.qjl.dequantize_batch(&qjl_signs, &residual_norms);
 
         x_mse + x_qjl
     }

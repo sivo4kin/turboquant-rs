@@ -49,5 +49,6 @@ pub use polar_quant::PolarQuant;
 pub use qjl::QJL;
 pub use turboquant::{CompressedVectors, TurboQuant, TurboQuantMSE};
 pub use utils::{
-    memory_footprint_bytes, pack_bits, pack_indices, unpack_bits, unpack_indices, MemoryFootprint,
+    memory_footprint_bytes, pack_bits, pack_bits_batch, pack_indices, pack_indices_batch,
+    unpack_bits, unpack_indices, unpack_indices_batch, MemoryFootprint,
 };

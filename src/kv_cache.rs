@@ -9,16 +9,17 @@
 use ndarray::{Array2, Array4};
 
 use crate::turboquant::{CompressedVectors, TurboQuant, TurboQuantMSE};
+use crate::utils::{pack_indices_batch, unpack_indices_batch};
 use ndarray::Array1;
 
 /// Container for a compressed KV cache.
 pub struct CompressedKVCache {
     /// Per-layer, per-head compressed K vectors.
     pub k_compressed: Vec<Vec<CompressedVectors>>,
-    /// Per-layer, per-head compressed V (indices).
-    pub v_indices: Vec<Vec<Array2<usize>>>,
-    /// Per-layer, per-head compressed V (norms).
-    pub v_norms: Vec<Vec<Array1<f64>>>,
+    /// Per-layer, per-head compressed V indices (packed, per token row).
+    pub v_indices_packed: Vec<Vec<Vec<Vec<u8>>>>,
+    /// Per-layer, per-head compressed V norms (float32, per token row).
+    pub v_norms: Vec<Vec<Vec<f32>>>,
 
     pub num_layers: usize,
     pub num_heads: usize,
@@ -84,7 +85,7 @@ impl KVCacheCompressor {
 
         let mut result = CompressedKVCache {
             k_compressed: Vec::with_capacity(num_layers),
-            v_indices: Vec::with_capacity(num_layers),
+            v_indices_packed: Vec::with_capacity(num_layers),
             v_norms: Vec::with_capacity(num_layers),
             num_layers,
             num_heads,
@@ -116,12 +117,12 @@ impl KVCacheCompressor {
 
                 // V: MSE quantize
                 let (v_indices, v_norms) = self.v_quantizer.quantize_batch(&v_vecs);
-                v_layer_idx.push(v_indices);
-                v_layer_norms.push(v_norms);
+                v_layer_idx.push(pack_indices_batch(&v_indices, self.v_bits));
+                v_layer_norms.push(v_norms.iter().map(|&v| v as f32).collect());
             }
 
             result.k_compressed.push(k_layer);
-            result.v_indices.push(v_layer_idx);
+            result.v_indices_packed.push(v_layer_idx);
             result.v_norms.push(v_layer_norms);
         }
 
@@ -151,10 +152,18 @@ impl KVCacheCompressor {
                 }
 
                 // V: dequantize
-                let v_hat = self.v_quantizer.dequantize_batch(
-                    &compressed.v_indices[layer][head],
-                    &compressed.v_norms[layer][head],
+                let v_indices = unpack_indices_batch(
+                    &compressed.v_indices_packed[layer][head],
+                    compressed.head_dim,
+                    compressed.v_bit_width,
                 );
+                let v_norms = Array1::from_vec(
+                    compressed.v_norms[layer][head]
+                        .iter()
+                        .map(|&v| v as f64)
+                        .collect::<Vec<_>>(),
+                );
+                let v_hat = self.v_quantizer.dequantize_batch(&v_indices, &v_norms);
                 for s in 0..compressed.seq_len {
                     for d in 0..compressed.head_dim {
                         v_cache[[layer, head, s, d]] = v_hat[[s, d]];
