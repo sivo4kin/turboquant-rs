@@ -210,44 +210,60 @@ impl TurboQuantMSE {
 mod tests {
     use super::*;
 
+    fn synthetic_batch(batch: usize, d: usize) -> Array2<f64> {
+        Array2::from_shape_fn((batch, d), |(i, j)| {
+            let t = (i * 19 + j * 11) as f64;
+            let base = (t / d as f64).sin() + 0.25 * (t / 13.0).cos();
+            let scale = 0.6 + (i % 7) as f64 * 0.25;
+            base * scale
+        })
+    }
+
     #[test]
     fn test_turboquant_roundtrip() {
-        let tq = TurboQuant::new(32, 3, 42, true);
-        let x = Array1::from_shape_fn(32, |i| (i as f64 + 1.0) / 32.0);
+        let d = 128;
+        let tq = TurboQuant::new(d, 3, 42, true);
+        let x = synthetic_batch(64, d);
 
-        let compressed = tq.quantize(&x);
+        let compressed = tq.quantize_batch(&x);
         let x_hat = tq.dequantize(&compressed);
-        let x_hat_vec = x_hat.row(0).to_owned();
 
-        // Check reconstruction error
-        let error: f64 = (&x - &x_hat_vec).mapv(|v| v * v).sum();
+        let error: f64 = (&x - &x_hat).mapv(|v| v * v).sum();
         let original: f64 = x.mapv(|v| v * v).sum();
         let relative_error = error / original;
         assert!(
-            relative_error < 1.0,
+            relative_error < 0.6,
             "TurboQuant relative MSE: {relative_error}"
         );
     }
 
     #[test]
     fn test_turboquant_inner_product_preservation() {
-        let tq = TurboQuant::new(64, 3, 42, true);
-        let x = Array1::from_shape_fn(64, |i| (i as f64 + 1.0) / 64.0);
-        let y = Array1::from_shape_fn(64, |i| (64.0 - i as f64) / 64.0);
+        let d = 128;
+        let batch = synthetic_batch(64, d);
+        let tq = TurboQuant::new(d, 3, 42, true);
 
-        let ip_original = x.dot(&y);
+        let c_tq = tq.quantize_batch(&batch);
+        let batch_tq = tq.dequantize(&c_tq);
 
-        let cx = tq.quantize(&x);
-        let cy = tq.quantize(&y);
-        let x_hat = tq.dequantize(&cx).row(0).to_owned();
-        let y_hat = tq.dequantize(&cy).row(0).to_owned();
-        let ip_approx = x_hat.dot(&y_hat);
+        let mut tq_rel_err = 0.0;
+        let mut n_pairs = 0usize;
+        for i in 0..32 {
+            let j = (i * 9 + 5) % 64;
+            let x = batch.row(i);
+            let y = batch.row(j);
+            let ip_original = x.dot(&y);
+            let denom = ip_original.abs().max(1e-8);
 
-        // Should preserve inner product within reasonable bounds
-        let relative_error = (ip_original - ip_approx).abs() / ip_original.abs();
+            let ip_tq = batch_tq.row(i).dot(&batch_tq.row(j));
+            tq_rel_err += (ip_original - ip_tq).abs() / denom;
+            n_pairs += 1;
+        }
+
+        let tq_mean = tq_rel_err / n_pairs as f64;
         assert!(
-            relative_error < 1.0,
-            "Inner product relative error: {relative_error}"
+            tq_mean < 0.2,
+            "TurboQuant mean inner product relative error: {tq_mean}"
         );
     }
 
@@ -259,17 +275,18 @@ mod tests {
 
     #[test]
     fn test_turboquant_mse_roundtrip() {
-        let tq = TurboQuantMSE::new(32, 3, 42, true);
-        let x = Array1::from_shape_fn(32, |i| (i as f64 + 1.0) / 32.0);
+        let d = 128;
+        let tq = TurboQuantMSE::new(d, 3, 42, true);
+        let x = synthetic_batch(64, d);
 
-        let (indices, norm) = tq.quantize(&x);
-        let x_hat = tq.dequantize(&indices, norm);
+        let (indices, norms) = tq.quantize_batch(&x);
+        let x_hat = tq.dequantize_batch(&indices, &norms);
 
         let error: f64 = (&x - &x_hat).mapv(|v| v * v).sum();
         let original: f64 = x.mapv(|v| v * v).sum();
         let relative_error = error / original;
         assert!(
-            relative_error < 1.0,
+            relative_error < 0.6,
             "TurboQuantMSE relative MSE: {relative_error}"
         );
     }

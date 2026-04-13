@@ -175,23 +175,31 @@ impl PolarQuant {
 mod tests {
     use super::*;
 
+    fn synthetic_batch(batch: usize, d: usize) -> Array2<f64> {
+        Array2::from_shape_fn((batch, d), |(i, j)| {
+            let phase = (i * 13 + j * 7) as f64;
+            let base = (phase / d as f64).sin() + 0.3 * (phase / 11.0).cos();
+            let scale = 0.5 + (i % 5) as f64 * 0.35;
+            base * scale
+        })
+    }
+
     #[test]
     fn test_quantize_dequantize_roundtrip() {
-        let pq = PolarQuant::new(32, 2, 42, true);
-        let x = Array1::from_shape_fn(32, |i| (i as f64 + 1.0) / 32.0);
-        let (indices, norm) = pq.quantize(&x);
-        let x_hat = pq.dequantize(&indices, norm);
+        let d = 128;
+        let pq = PolarQuant::new(d, 2, 42, true);
+        let x = synthetic_batch(64, d);
+        let (indices, norms) = pq.quantize_batch(&x);
+        let x_hat = pq.dequantize_batch(&indices, &norms);
 
-        // Check shapes
-        assert_eq!(indices.len(), 32);
-        assert_eq!(x_hat.len(), 32);
+        assert_eq!(indices.dim(), (64, d));
+        assert_eq!(x_hat.dim(), (64, d));
 
-        // Check reconstruction error is bounded
         let error: f64 = (&x - &x_hat).mapv(|v| v * v).sum();
         let original: f64 = x.mapv(|v| v * v).sum();
         let relative_error = error / original;
         assert!(
-            relative_error < 1.0,
+            relative_error < 0.75,
             "Relative MSE too large: {relative_error}"
         );
     }
